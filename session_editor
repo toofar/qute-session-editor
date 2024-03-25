@@ -1,0 +1,906 @@
+#!/usr/bin/env python3
+
+# TODO: how to handle having an external dependency?
+# * re-launch based on env vars like PYTHON or QUTE_USERSCRIPT_PYTHON? that is
+#   set in config.py?
+# * a config item?
+# * try setting PYTHONPATH to a venv that doesn't have a qute dependency in
+#   config.py and see if that breaks stuff (probably good not to have the
+#   userscript libs tied to the system python anyway? maybe?)
+# * just run venv from in here and create a new one in the userscripts
+#   folder???
+# * ??? try to think of better ideas
+
+import os, sys
+python = os.environ.get(
+    "QUTE_USERSCRIPT_PYTHON",
+    os.environ.get("PYTHON"),  # I'm setting this in my launch script already
+)
+
+sentinel = "QUTE_USERSCRIPT_SESSION_EDITOR_RELAUNCHED"
+if python and not os.environ.get(sentinel):
+    os.environ[sentinel] = "1"
+    import subprocess
+    try:
+        subprocess.run(
+            [python] + sys.argv,
+            check=True,
+        )
+    except subprocess.CalledProcessError as err:
+        sys.exit(err.returncode)
+
+    sys.exit(0)
+
+import sys, yaml, tempfile, glob, dataclasses, shutil, copy
+import urllib.parse as urlparse
+try:
+    from yaml import (CSafeLoader as YamlLoader,
+                      CSafeDumper as YamlDumper)
+except ImportError:  # pragma: no cover
+    from yaml import (SafeLoader as YamlLoader,  # type: ignore[assignment]
+                      SafeDumper as YamlDumper)
+
+def qute_command(command):
+    with open(os.environ["QUTE_FIFO"], "w") as fifo:
+        fifo.write(command + "\n")
+        fifo.flush()
+try:
+    import flask
+    import jinja2
+    from markupsafe import escape
+except ImportError as err:
+    qute_command(f"message-error 'error running session_editor userscript: {err}")
+    sys.exit(1)
+
+data_dir = os.environ["QUTE_DATA_DIR"]
+# XXX: don't us a real session dir during development :)
+real_sessions_dir = os.path.join(data_dir, "sessions")
+sessions_dir = "."
+assert os.path.realpath(real_sessions_dir) != os.path.realpath(sessions_dir)
+
+MAX_OPEN_SESSIONS = 2
+
+app = flask.Flask("session_editor")
+
+open_sessions = []
+@dataclasses.dataclass
+class TabSelection:
+    session_name: str
+    window_idx: int
+    idx: int
+selected_tabs = []
+
+def active_tab(tab):
+    try:
+        return [entry for entry in tab["history"] if entry.get("active")][0]
+    except KeyError:
+        print(tab)
+        import pdbr
+        pdbr.set_trace()
+        raise
+
+class Session:
+    def __init__(self, path, data=None):
+        self.path = path
+        self.name = os.path.splitext(os.path.basename(path))[0]
+        if not data:
+            with open(path) as f:
+                self.data = yaml.load(f, Loader=YamlLoader)
+        else:
+            self.data = data
+
+    @classmethod
+    def new(klass, name, directory):
+        path = os.path.join(
+            directory, name + ".yml",
+        )
+        data = {
+            "windows": [
+                {
+                    "active": True,
+                    "geometry": None,
+                    "tabs": [],
+                },
+            ]
+        }
+        new_session = klass(path=path, data=data)
+        new_session.save()
+        list_sessions(force=True)  # lazy add to cache
+        return new_session
+
+    def delete(self):
+        shutil.copyfile(self.path, self.path + '.backup')
+        os.remove(self.path)
+        list_sessions(force=True)  # lazy update cache
+
+    def save(self):
+        with open(self.path, 'wb') as f:
+            yaml.dump(
+                self.data,
+                f,
+                Dumper=YamlDumper,
+                default_flow_style=False,
+                encoding='utf-8',
+                allow_unicode=True,
+            )
+
+    def sidebar_info(self):
+        name = escape(self.name)
+        open_names = [s.name for s in open_sessions]
+        class_ = "selected" if self.name in open_names else ""
+        # TODO: should the query param be escaped?
+        return f"""
+    <div
+      class='{class_}'
+      hx-get='/select-session?name={name}'
+    >
+    {name}
+      <button
+        title='delete session'
+        class='delete delete-session'
+        hx-get='/delete-session?name={name}'
+        hx-target='body'
+        hx-trigger='click consume'
+      >
+      x
+      </button>
+    </div>
+    """
+
+    tab_template = jinja2.Template("""
+      <div
+        class='tab {{ selected }}'
+        hx-get='/select-tab?session={{ session }}&window={{ window_idx }}&tab={{ idx }}'
+        hx-target='this'
+        hx-swap='outerHTML'
+      >
+      {{ active["title"] }} - {{ active["url"] }}
+        <button
+          class='delete delete-tab'
+          hx-get='/delete-tab?session={{ session }}&window={{ window_idx }}&tab={{ idx }}'
+          hx-target='.session#{{ session }}'
+          hx-trigger='click consume'
+        >
+        x
+        </button>
+      </div>
+    """)
+    def render_tab(self, tab, idx, window_idx):
+        this = TabSelection(
+            session_name=self.name,
+            window_idx=window_idx,
+            idx=idx,
+        )
+        class_ = "selected" if this in selected_tabs else ""
+        return self.tab_template.render(
+            selected=class_,
+            active=active_tab(tab),
+            session=self.name,
+            idx=idx,
+            window_idx=window_idx,
+        )
+
+    button_template = jinja2.Template("""
+        Bulk actions:
+        <button
+          title='delete selected'
+          hx-get='/delete-selected?session={{ session }}'
+          hx-target='.session#{{ session }}'
+          hx-swap='outerHTML'
+        >x</button>
+        <button
+          title='move selected to other session'
+          hx-get='/move-selected?session={{ session }}'
+          hx-target='body'
+        >{{ text }}</button>
+    """)
+    def render_buttons(self):
+        on_left = open_sessions[0] == self
+        if on_left:
+            text = "→"
+        else:
+            text = "←"
+        return self.button_template.render(
+            session=self.name,
+            text=text,
+        )
+
+    session_template = jinja2.Template("""
+      <section class='session' id='{{ name }}'>
+      <p>
+        <div class="buttons">{{ render_buttons() }}</div>
+        <b>Session</b>: {{ name }}
+      </p>
+      {% for window in data.get("windows", []) %}
+        {% set window_idx = loop.index - 1 %}
+        <div>
+          <b>Window</b> {{ window_idx }}
+          <button
+            title='add tab'
+            class='new new-tab'
+            hx-get='/request-new-tab?session={{ name }}&window={{ window_idx }}'
+            hx-target='this'
+            hx-swap='outerHTML'
+          >
+          +
+          </button>
+        </div>
+        <div class='tablist' id='session={{ name }}&window={{ window_idx }}'>
+        {% for tab in window["tabs"] %}
+          {{ render_tab(tab, idx=loop.index - 1, window_idx=window_idx) | safe }}
+        {% endfor %}
+        </div>
+      {% endfor %}
+      </section>
+    """)
+    def render_session(self):
+        return self.session_template.render(
+            name=self.name,
+            render_buttons=self.render_buttons,
+            render_tab=self.render_tab,
+            data=self.filtered_data(),
+        )
+
+    def filtered_data(self):
+        ret = {"windows": []}
+
+        def tab_matches(tab):
+            if not filter_text:
+                return True
+            active = active_tab(tab)
+            return (
+                filter_text in active["title"]
+                or filter_text in active["url"]
+            )
+
+        for window in self.data.get("windows", []):
+            window = copy.deepcopy(window)
+            tabs = [
+                tab
+                for tab in window["tabs"]
+                if tab_matches(tab)
+            ]
+            if tabs:
+                window["tabs"] = tabs
+                ret["windows"].append(window)
+        return ret
+
+    new_session_form_template = jinja2.Template("""
+      <form>
+        <input id='new-session' name='name' type='text' autofocus></input>
+        <button
+          class='accept new-session'
+          hx-post='/create-new-session'
+          hx-target='body'
+        >
+        ✔
+        </button>
+        <button
+          class='cancel new-session'
+          hx-post='/cancel-new-session'
+          hx-target='#session-sidebar'
+          hx-swap='outerHTML'
+        >
+        x
+        </button>
+      </form>
+    """)
+    @classmethod
+    def render_new_session_form_template(klass):
+        return klass.new_session_form_template.render()
+
+search_form_template = jinja2.Template("""
+  <form>
+    <input
+      id='search'
+      name='value'
+      type='text'
+      value='{{ value }}'
+      autofocus
+      hx-get='/update-search'
+      hx-target='body'
+      hx-trigger='keyup changed delay:100ms'
+      >
+    </input>
+    <button
+      class='cancel search'
+      hx-post='/cancel-search'
+      hx-target='body'
+    >
+    x
+    </button>
+  </form>
+""")
+
+filter_text=None
+
+def render_search_form():
+    return search_form_template.render(
+        value=filter_text or '',
+    )
+
+@app.route("/request-search", methods=["GET", "POST"])
+def request_search():
+    state_from_url()
+    return make_htmx_response(render_search_form())
+
+@app.route("/cancel-search", methods=["GET", "POST"])
+def cancel_search():
+    global filter_text
+    state_from_url()
+    if not filter_text:
+        return sidebar_response()
+    else:
+        filter_text = None
+        return make_htmx_response(render())
+
+@app.route("/update-search", methods=["GET", "POST"])
+def update_search():
+    global filter_text
+    state_from_url()
+    filter_text = flask.request.args["value"]
+    return make_htmx_response(
+        render(
+            sidebar_header=render_search_form(),
+        )
+    )
+
+SESSION_CACHE = None
+def list_sessions(force=False):
+    global SESSION_CACHE
+    if force or not SESSION_CACHE:
+        all_sessions = [Session(name) for name in glob.glob(
+            os.path.join(sessions_dir, "*.yml")
+        )]
+        SESSION_CACHE = all_sessions
+    return SESSION_CACHE
+
+sidebar_buttons = jinja2.Template("""
+  <span id='sidebar-buttons'>
+    <button
+      class='new new-session'
+      title='create new session'
+      hx-get='/request-new-session'
+      hx-target='#sidebar-buttons'
+      hx-swap='outerHTML'
+    >
+    +
+    </button>
+    <button
+      class='search'
+      title='search for tabs'
+      hx-get='/request-search'
+      hx-target='#sidebar-buttons'
+      hx-swap='outerHTML'
+    >
+    🔍
+    </button>
+  </span>
+""")
+sidebar_template = jinja2.Template("""
+    <aside id='session-sidebar' hx-target='body'>
+      <p>
+        <i>Sessions:</i>
+        {{ sidebar_header | safe }}
+      </p>
+      {% for session in all_sessions %}
+        {{ session.sidebar_info() | safe }}
+      {% endfor %}
+    </aside>
+""")
+def render_sidebar(all_sessions, sidebar_header=None):
+    return sidebar_template.render(
+        all_sessions=all_sessions,
+        sidebar_header=sidebar_header or sidebar_buttons.render(),
+    )
+
+def sidebar_response():
+    return make_htmx_response(
+        render_sidebar(list_sessions()),
+        headers={
+            "HX-Retarget": "#session-sidebar",
+            "HX-Reswap": "outerHTML",
+        },
+    )
+
+
+template = """
+<html>
+  <head>
+    <script src="https://unpkg.com/htmx.org@1.9.10" integrity="sha384-D1Kt99CQMDuVetoL1lrYwg5t+9QdHe7NLX/SoJYkXDFfX37iInKRy5xLSi8nO7UC" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@latest/Sortable.min.js"></script>
+    <style type='text/css'>
+    #content {
+      display: flex;
+    }
+    #session-sidebar {
+      width: 15%
+    }
+    #session-sidebar div button {
+      display: none;
+    }
+    #session-sidebar .selected {
+      border-style: dotted;
+    }
+    #session-sidebar div.selected button {
+      display: inline;
+    }
+    #open-sessions {
+      display: inline-flex;
+      width: 85%;
+    }
+    .session {
+      width: 50%;
+      overflow: scroll;
+      & .buttons {
+        float: right;
+      }
+    }
+    .tab {
+      padding: 0.5em;
+      & button {
+        display: none;
+      }
+    }
+    .tab.selected {
+      border-style: dotted;
+      & button {
+        display: inline;
+      }
+    }
+    </style>
+  </head>
+  <body>
+  <div id='content'>
+    {{ render_sidebar(all_sessions, sidebar_header=sidebar_header) | safe }}
+    <div id='open-sessions'>
+      {% for session in open_sessions %}
+        {{ session.render_session() | safe }}
+      {% endfor %}
+    </div>
+  </div>
+    <script>
+      // Add Sortable.js to the tab list of each session to allow drag and
+      // drop to re-order tabs and move then between session.
+      // Clean up and re-initialise sortables on each event because if we
+      // don't clean them up it can get quite slow.
+      window.allSortables = []
+      htmx.onLoad(function(content) {
+        var sessions = content.querySelectorAll('.tablist')
+        if (sessions.length <= 0)
+          return
+        for (var sortable of allSortables) {
+          if (sortable.el == null) {
+            // destroy does not work well if the element is already gone
+            var temp = document.createElement('p')
+            sortable.el = temp
+          }
+          sortable.destroy()
+        }
+        window.allSortables = []
+        for (var session of sessions) {
+          allSortables.push(new Sortable(session, {
+              group: 'shared',
+              animation: 150,
+              multiDrag: true, // why is this not working?
+              selectedClass: 'selected',
+
+              onEnd: function(evt) {
+                var data = {
+                  from: evt.from.id,
+                  to: evt.to.id,
+                  newIndex: evt.newIndex,
+                  oldIndex: evt.oldIndex
+                }
+                htmx.ajax(
+                  'POST',
+                  '/move-tab',
+                  {
+                    values: data,
+                  }
+                )
+              }
+            })
+          )
+        }
+      })
+    </script>
+  <body>
+</html>
+"""
+
+def render(sidebar_header=None):
+    return flask.render_template_string(
+        template,
+        render_sidebar=render_sidebar,
+        all_sessions=list_sessions(),
+        open_sessions=open_sessions,
+        sidebar_header=sidebar_header,
+    )
+
+def generate_url():
+    params = {}
+    if open_sessions:
+        params["session"] = ",".join([s.name for s in open_sessions])
+    return "/?" + urlparse.urlencode(params, safe=",")
+
+def make_htmx_response(*args, headers=None, **kwargs):
+    # Save some state in query params to survive script restarts.
+    # TODO: save selected tabs too?
+    response = flask.make_response(*args, **kwargs)
+    response.headers["HX-Replace-Url"] = generate_url()
+    if headers:
+        response.headers.update(headers)
+    return response
+
+def state_from_url():
+    global open_sessions
+    # Restore state saved in make_htmx_response()
+    if htmx_url := flask.request.headers.get("Hx-Current-Url"):
+        query = dict(urlparse.parse_qsl(urlparse.urlparse(htmx_url).query))
+    else:
+        query = flask.request.args
+    session_arg = [s for s in query.get("session", "").split(",") if s]
+    open_sessions = []
+    for name in session_arg:
+        if found := [s for s in list_sessions() if s.name == name]:
+            open_sessions.append(found[0])
+
+@app.route("/")
+def root():
+    state_from_url()
+    return make_htmx_response(render())
+
+@app.route("/select-session", methods=["GET", "POST"])
+def select_session(new_names=None):
+    global open_sessions
+    state_from_url()
+    if not new_names:
+        new_names = flask.request.args.getlist("name")
+    all_sessions = list_sessions()
+
+    for name in new_names:
+        already_open = [s for s in open_sessions if s.name == name]
+        if already_open:
+            # TODO: probably have add and remove be different endpoints?
+            open_sessions.remove(already_open[0])
+            for selection in reversed(selected_tabs):
+                if selection.session_name == name:
+                    selected_tabs.remove(selection)
+            break
+
+        found = [s for s in all_sessions if s.name == name]
+        new_session = open_sessions + found
+        open_sessions = new_session[-MAX_OPEN_SESSIONS:]
+
+    # Repaint everything because we are changing the sidebar and at least one
+    # content pane
+    return make_htmx_response(render())
+
+def tab_common():
+    state_from_url()
+    clicked = TabSelection(
+        session_name=flask.request.args["session"],
+        window_idx=int(flask.request.args["window"]),
+        idx=int(flask.request.args["tab"]),
+    )
+    existing_selection = clicked in selected_tabs
+    session = [s for s in open_sessions if s.name == clicked.session_name][0]
+    window = session.data["windows"][clicked.window_idx]
+    return clicked, existing_selection, session, window
+
+@app.route("/select-tab", methods=["GET", "POST"])
+def select_tab():
+    selection, existing, session, window = tab_common()
+    if existing:
+        selected_tabs.remove(selection)
+    else:
+        selected_tabs.append(selection)
+
+    tab = window["tabs"][selection.idx]
+    return session.render_tab(tab, selection.idx, selection.window_idx)
+
+@app.route("/delete-tab", methods=["GET", "POST"])
+def delete_tab():
+    selection, existing, session, window = tab_common()
+    if existing:
+        selected_tabs.remove(selection)
+    else:
+        flask.abort(400)
+
+    window["tabs"] = [
+        tab
+        for idx, tab in enumerate(window["tabs"])
+        if idx != selection.idx
+    ]
+    session.save()
+    return session.render_session()
+
+new_tab_form_template = jinja2.Template("""
+  <form>
+    <label>
+    Title:
+    <input class='new-tab' name='title' type='text' autofocus></input>
+    </label>
+    </br>
+    <label>
+    URL:
+    <input class='new-tab' name='url' type='text'></input>
+    </label>
+    <button
+      class='accept new-tab'
+      hx-post='/create-new-tab?session={{ session }}&window={{ window_idx }}'
+      hx-target='.session#{{ session }}'
+      hx-swap='outerHTML'
+    >
+    ✔
+    </button>
+    <button
+      class='cancel new-tab'
+      hx-post='/cancel-new-tab?session={{ session }}'
+      hx-target='.session#{{ session }}'
+      hx-swap='outerHTML'
+    >
+    x
+    </button>
+  </form>
+""")
+@app.route("/request-new-tab", methods=["GET", "POST"])
+def request_new_tab():
+    state_from_url()
+    session_name = flask.request.args["session"]
+    window_idx = int(flask.request.args["window"])
+    return make_htmx_response(new_tab_form_template.render(
+        session=session_name,
+        window_idx=window_idx,
+    ))
+
+@app.route("/cancel-new-tab", methods=["GET", "POST"])
+def cancel_new_tab():
+    state_from_url()
+    session_name = flask.request.args["session"]
+    session = [s for s in open_sessions if s.name == session_name][0]
+    return make_htmx_response(session.render_session())
+
+@app.route("/create-new-tab", methods=["GET", "POST"])
+def create_new_tab():
+    state_from_url()
+    session_name = flask.request.args["session"]
+    window_idx = int(flask.request.args["window"])
+    session = [s for s in open_sessions if s.name == session_name][0]
+    window = session.data["windows"][window_idx]
+
+    title = flask.request.form["title"]
+    url = flask.request.form["url"]
+
+    window["tabs"].append({
+        "history": [{
+            "active": True,
+            "title": title,
+            "url": url,
+        }],
+    })
+
+    session.save()
+    return make_htmx_response(session.render_session())
+
+@app.route("/delete-selected", methods=["GET", "POST"])
+def delete_selected():
+    global selected_tabs
+    state_from_url()
+    session_name = flask.request.args["session"]
+    session = [s for s in open_sessions if s.name == session_name][0]
+    session_selected = [
+        tab for tab in selected_tabs if tab.session_name == session_name
+    ]
+
+    for idx, window in enumerate(session.data["windows"]):
+        selected_idxs = {
+            selected.idx
+            for selected in session_selected
+            if selected.window_idx == idx
+        }
+        # Iterate over tabs backwards, removed selected indexes, put back in
+        # right order.
+        window["tabs"] = list(
+            reversed([
+                tab
+                for idx, tab
+                in reversed(list(enumerate(window["tabs"])))
+                if idx not in selected_idxs
+            ])
+        )
+
+    # Remove the deleted tabs from the selected list now.
+    for tab in session_selected:
+        selected_tabs.remove(tab)
+    session.save()
+    return session.render_session()
+
+@app.route("/move-tab", methods=["POST"])
+def move_tab():
+    # Called when a tab drag event is finished.
+    state_from_url()
+    from_query = dict(urlparse.parse_qsl(flask.request.form["from"]))
+    to_query = dict(urlparse.parse_qsl(flask.request.form["to"]))
+    new_idx = int(flask.request.form["newIndex"])
+    old_idx = int(flask.request.form["oldIndex"])
+    if from_query == to_query and new_idx == old_idx:
+        # Aborted drag
+        return ("", 204)
+
+    from_session = [s for s in open_sessions if s.name == from_query["session"]][0]
+    from_window = from_session.data["windows"][int(from_query["window"])]
+
+    to_session = [s for s in open_sessions if s.name == to_query["session"]][0]
+    to_window = to_session.data["windows"][int(to_query["window"])]
+
+    to_window["tabs"].insert(new_idx, from_window["tabs"].pop(old_idx))
+    to_session.save()
+    from_session.save()
+    target = TabSelection(
+        session_name=from_session.name,
+        window_idx=int(from_query["window"]),
+        idx=old_idx,
+    )
+    existing = [s for s in selected_tabs if s == target]
+    # If the moved tab was in the selected state at the time, update our
+    # records
+    # Any selected ones after us in the old list that need to be bumped down?
+    to_decrement = [
+        selection
+        for selection in selected_tabs
+        if selection.session_name == from_session.name
+        and selection.window_idx == int(from_query["window"])
+        and selection.idx > old_idx
+    ]
+    for selection in to_decrement:
+        selection.idx -= 1
+    # Any selected ones after us in the new list that need make room?
+    to_increment = [
+        selection
+        for selection in selected_tabs
+        if selection.session_name == to_session.name
+        and selection.window_idx == int(to_query["window"])
+        and selection.idx >= new_idx
+    ]
+    for selection in to_increment:
+        selection.idx += 1
+    # If the source tab was selected, set it to the dest position.
+    if existing:
+        existing[0].session_name = to_session.name
+        existing[0].window_idx = int(to_query["window"])
+        existing[0].idx = new_idx
+
+    return make_htmx_response(
+        render(),
+        headers={"HX-Retarget": "body"},
+    )
+
+
+@app.route("/move-selected", methods=["GET", "POST"])
+def move_selected():
+    state_from_url()
+    session_name = flask.request.args["session"]
+    session = [s for s in open_sessions if s.name == session_name][0]
+    to_session = [s for s in open_sessions if s != session][0]
+    session_selected = [
+        tab for tab in selected_tabs if tab.session_name == session_name
+    ]
+
+    # remove selected tabs from session
+    # add them to bottom of last window of to_session
+    # adjust selected_tabs
+
+    to_take = []
+    for window_idx, window in enumerate(session.data["windows"]):
+        for idx in reversed(range(len(window["tabs"]))):
+            tab_selection = TabSelection(
+                session_name=session_name,
+                window_idx=window_idx,
+                idx=idx,
+            )
+            if tab_selection in session_selected:
+                to_take.append(window["tabs"].pop(idx))
+
+    to_window = to_session.data["windows"][-1]
+    to_window["tabs"].extend(to_take)
+    to_session.save()
+
+    new_offset = len(to_window["tabs"]) - len(session_selected)
+    for idx, selection in enumerate(session_selected):
+        selection.session_name = to_session.name
+        selection.window_idx = len(to_session.data["windows"]) - 1
+        selection.idx = new_offset + idx
+    return make_htmx_response(render())
+
+@app.route("/request-new-session", methods=["GET", "POST"])
+def request_new_session():
+    state_from_url()
+    return make_htmx_response(Session.render_new_session_form_template())
+
+@app.route("/cancel-new-session", methods=["GET", "POST"])
+def cancel_new_session():
+    state_from_url()
+    return sidebar_response()
+
+@app.route("/create-new-session", methods=["GET", "POST"])
+def create_new_session():
+    state_from_url()
+    new_name = flask.request.form["name"]
+    session = Session.new(name=new_name, directory=sessions_dir)
+    # TODO: test what happens if qute tries to open one of these empty
+    # sessions. Same for create tab
+    return select_session(new_names=[new_name])
+
+@app.route("/delete-session", methods=["GET", "POST"])
+def delete_session():
+    state_from_url()
+    session_name = flask.request.args["name"]
+    session = [s for s in open_sessions if s.name == session_name][0]
+    session.delete()
+    return select_session(new_names=[session_name])
+
+app.run(debug=True)
+
+"""
+TODO:
+* display selected sessions differently in sidebar (/)
+* allow selecting tabs (maybe time to use htmx for xhrs? or redirect back to
+  root after taking action) (/)
+  * refactor tab selection, could use a helper class?
+* allow deleting a tab (/)
+* write back modified sessions (or all of them) (/)
+* why are the two session going off of the right side of the page? They are
+  set to 50%, but of what? (/)
+* allow creating a new session (/)
+  * things we can make new of:
+      * session
+      * window (TODO)
+      * tab in window
+* allow deleting a session (/)
+* allow moving tab between sessions (/)
+  * UX can be a bit confusing, do you click on the dest or source session?
+  * maybe make the button point the appropriate depending on left or right tab
+* re-order tabs (/)
+* filter tabs
+  * might want a "select all" batch button for the filtered use case too
+  * https://github.com/qutebrowser/qutebrowser/issues/7369
+  * decided to go with a single global filter after thinking about it for a
+    while because it felt like the easiest thing. But I'm not sure it's the
+    best UX for finding an entry in a session that you want to move to another
+    session. It might work though, just that the session you are moving it to
+    will appear empty
+  * fill in update_search() to actually filter (/)
+  * *TODO: select all?*
+* search in all sessions
+* open in qutebrowser
+* before request: if not htmx: flask.redirect(url_for("/"))
+* make pretty
+  * style scroll bars
+  * spacing and background of "list" elements to make them appear distinct
+    (maybe copy default qute styles, eg qute://tabs/ and the new settings
+    stuff)
+  * make text smaller? Ideally you need to be able to see lots of item on the
+    screen. Maybe add zoom buttons?
+* make session name sticky
+* swap sessions between sides
+* reconsider data structures. The flow from /select-tab is not so great.
+* proxy htmx JS file to avoid ad blockers etc?
+* have a mode where changes aren't applied immediately but shown on the page
+  (eg red or green backgrounds) and there is a button to apply them
+* move save and restore state to middleware/hooks
+* pull forms and buttons out to (python) classes?
+* collapse windows
+* bulk drag selected
+* Session.filtered_data() is a bit ugly
+* refactor everything to be a nice responsibly separated object hierarchy and
+  try to move attributes out of the html into the responses from python.
+  * for example to enable things like in cancel_search where we can return
+    either the new sidebar or replace the whole body
+  * an object should have its data, know how to render that, know where it
+    needs to go to
+  * probably it'll need a render() and a response() method
+  * I think you'll have to restructure the object hierarchy, eg have the
+    sidebar know about the sidebar header instead of passing it in
+"""
