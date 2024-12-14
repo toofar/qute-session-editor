@@ -62,9 +62,10 @@ MAX_OPEN_SESSIONS = 2
 
 app = flask.Flask("session_editor")
 
-filter_text=None
+filter_text = None
 open_sessions = []
 selected_tabs = []
+_filter_text_sentinal = object()
 
 @dataclasses.dataclass
 class TabSelection:
@@ -91,6 +92,14 @@ class Session:
         else:
             self.data = data
 
+        self.update_indices()
+
+    def update_indices(self):
+        for win_idx, window in enumerate(self.data.get("windows", [])):
+            window["idx"] = win_idx
+            for tab_idx, tab in enumerate(window.get("tabs", [])):
+                tab["idx"] = tab_idx
+
     @classmethod
     def new(klass, name, directory):
         path = os.path.join(
@@ -101,6 +110,7 @@ class Session:
                 {
                     "active": True,
                     "geometry": None,
+                    "idx": 0,
                     "tabs": [],
                 },
             ]
@@ -116,9 +126,10 @@ class Session:
         list_sessions(force=True)  # lazy update cache
 
     def save(self):
+        self.update_indices()
         with open(self.path, 'wb') as f:
             yaml.dump(
-                self.filtered_data(filter_text=None),
+                self.filtered_data(filter_text_override=None),
                 f,
                 Dumper=YamlDumper,
                 default_flow_style=False,
@@ -178,7 +189,7 @@ class Session:
             selected=class_,
             active=active_tab(tab),
             session=self.name,
-            idx=idx,
+            idx=tab["idx"],
             window_idx=window_idx,
         )
 
@@ -242,21 +253,26 @@ class Session:
             data=self.filtered_data(),
         )
 
-    def filtered_data(self, filter_text=filter_text):
+    def filtered_data(self, filter_text_override=_filter_text_sentinal):
+        # TODO: add a button to delete windows and get rid of this override
+        # nonsense
+        if filter_text_override == _filter_text_sentinal:
+            _filter_text = filter_text
+        else:
+            _filter_text = filter_text_override
         ret = {"windows": []}
 
         def tab_matches(tab):
-            if not filter_text:
+            if not _filter_text:
                 return True
             active = active_tab(tab)
             return (
-                filter_text in active["title"]
-                or filter_text in active["url"]
+                _filter_text in active["title"]
+                or _filter_text in active["url"]
             )
 
-        for win_idx, window in enumerate(self.data.get("windows", [])):
+        for window in self.data.get("windows", []):
             window = copy.deepcopy(window)
-            window["idx"] = win_idx
             tabs = [
                 tab
                 for tab in window["tabs"]
