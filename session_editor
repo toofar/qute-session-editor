@@ -62,13 +62,15 @@ MAX_OPEN_SESSIONS = 2
 
 app = flask.Flask("session_editor")
 
+filter_text=None
 open_sessions = []
+selected_tabs = []
+
 @dataclasses.dataclass
 class TabSelection:
     session_name: str
     window_idx: int
     idx: int
-selected_tabs = []
 
 def active_tab(tab):
     try:
@@ -116,7 +118,7 @@ class Session:
     def save(self):
         with open(self.path, 'wb') as f:
             yaml.dump(
-                self.data,
+                self.filtered_data(filter_text=None),
                 f,
                 Dumper=YamlDumper,
                 default_flow_style=False,
@@ -212,22 +214,21 @@ class Session:
         <b>Session</b>: {{ name }}
       </p>
       {% for window in data.get("windows", []) %}
-        {% set window_idx = loop.index - 1 %}
         <div>
-          <b>Window</b> {{ window_idx }}
+          <b>Window</b> {{ window["idx"] }}
           <button
             title='add tab'
             class='new new-tab'
-            hx-get='/request-new-tab?session={{ name }}&window={{ window_idx }}'
+            hx-get='/request-new-tab?session={{ name }}&window={{ window["idx"] }}'
             hx-target='this'
             hx-swap='outerHTML'
           >
           +
           </button>
         </div>
-        <div class='tablist' id='session={{ name }}&window={{ window_idx }}'>
+        <div class='tablist' id='session={{ name }}&window={{ window["idx"] }}'>
         {% for tab in window["tabs"] %}
-          {{ render_tab(tab, idx=loop.index - 1, window_idx=window_idx) | safe }}
+          {{ render_tab(tab, idx=loop.index - 1, window_idx=window["idx"]) | safe }}
         {% endfor %}
         </div>
       {% endfor %}
@@ -241,7 +242,7 @@ class Session:
             data=self.filtered_data(),
         )
 
-    def filtered_data(self):
+    def filtered_data(self, filter_text=filter_text):
         ret = {"windows": []}
 
         def tab_matches(tab):
@@ -253,8 +254,9 @@ class Session:
                 or filter_text in active["url"]
             )
 
-        for window in self.data.get("windows", []):
+        for win_idx, window in enumerate(self.data.get("windows", [])):
             window = copy.deepcopy(window)
+            window["idx"] = win_idx
             tabs = [
                 tab
                 for tab in window["tabs"]
@@ -311,8 +313,6 @@ search_form_template = jinja2.Template("""
     </button>
   </form>
 """)
-
-filter_text=None
 
 def render_search_form():
     return search_form_template.render(
@@ -806,6 +806,7 @@ def move_selected():
     to_window = to_session.data["windows"][-1]
     to_window["tabs"].extend(to_take)
     to_session.save()
+    session.save()
 
     new_offset = len(to_window["tabs"]) - len(session_selected)
     for idx, selection in enumerate(session_selected):
@@ -873,6 +874,9 @@ TODO:
     will appear empty
   * fill in update_search() to actually filter (/)
   * *TODO: select all?*
+* allow creating new windows - important for being able to construct sessions
+* allow deleting windows too - and then change filtered_data() to now skip
+  empty windows
 * search in all sessions
 * open in qutebrowser
 * before request: if not htmx: flask.redirect(url_for("/"))
@@ -903,4 +907,8 @@ TODO:
   * probably it'll need a render() and a response() method
   * I think you'll have to restructure the object hierarchy, eg have the
     sidebar know about the sidebar header instead of passing it in
+* show how many items have been filtered when searching (or still shown, eg 12/100) - eg so it's more obvious that what's happening
+* highlight search matches
+* rethink backups - maybe just have a backup button that will zip the whole
+  folder?
 """
